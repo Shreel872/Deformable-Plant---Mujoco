@@ -1,20 +1,4 @@
-"""
-main.py - Deformable Plant with In-Scene Force Visualisation
 
-Two windows:
-  1. MuJoCo viewer  - 3D sim with live force arrow + label at contact point
-  2. Pygame window  - two separate real-time strip charts:
-                       top panel    -> Contact Force (N) vs time
-                       bottom panel -> Stem Tip Displacement (m) vs time
-
-CONTROLS (global via pynput):
-  Arrow UP / DOWN     -> move ball toward / away from plant
-  Arrow LEFT / RIGHT  -> move ball left / right
-  [ / ]               -> move ball up / down
-  backslash           -> reset ball to start position
-
-Requires: pip install pynput pygame
-"""
 
 from lsystem_generator import LSystemPlant
 from xml_modifier import XMLModifier
@@ -47,7 +31,6 @@ shared = {
 keys_held = set()
 
 
-# ── Keyboard ──────────────────────────────────────────────────────────────────
 def _start_keyboard():
     try:
         from pynput import keyboard as kb
