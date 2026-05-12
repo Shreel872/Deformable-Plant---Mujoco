@@ -1,6 +1,6 @@
+"""mujoco sim + pygame force/displacement plots. arrows move ball, [/] up-down, \\ reset."""
 
-
-from lsystem_generator import LSystemPlant
+from lsystem_generator import StrawberryLSystem
 from xml_modifier import XMLModifier
 import mujoco
 import mujoco.viewer
@@ -12,7 +12,6 @@ import pygame
 BALL_SPEED = 1
 HISTORY    = 1500
 
-# Pygame colours
 BG    = (12,  12,  20)
 WHITE = (220, 220, 220)
 GREY  = (60,  60,  80)
@@ -45,31 +44,49 @@ def _start_keyboard():
         return False, None
 
 
-def get_all_contacts(model, data):
+def read_probe_wrench(model, data):
+    # fake an F/T sensor at probe_ft site — sum contact wrenches in world frame,
+    # then rotate into probe body frame
+    gid       = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "probe_geom")
+    site_id   = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "probe_ft")
+    site_pos  = data.site_xpos[site_id]
+    site_R    = data.site_xmat[site_id].reshape(3, 3)
 
-    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "probe_geom")
+    F_w = np.zeros(3)
+    M_w = np.zeros(3)
     contacts = []
+
     for i in range(data.ncon):
         c = data.contact[i]
-        if c.geom1 == gid or c.geom2 == gid:
-            cf = np.zeros(6, dtype=np.float64)
-            mujoco.mj_contactForce(model, data, i, cf)
-            f_mag = abs(cf[0])
-            if f_mag > 0.001:
-                pos    = np.array(c.pos)
-                normal = np.array(c.frame[:3])
-                if c.geom2 == gid:
-                    normal = -normal
-                contacts.append((pos, normal, f_mag))
-    return contacts
+        if c.geom1 != gid and c.geom2 != gid:
+            continue
+
+        cf = np.zeros(6, dtype=np.float64)
+        mujoco.mj_contactForce(model, data, i, cf)
+
+        f_local = np.array([cf[0], cf[1], cf[2]])
+        R_c     = np.array(c.frame).reshape(3, 3)
+        f_world = R_c.T @ f_local
+        # flip if probe is geom1, so we get force *on* the probe
+        if c.geom1 == gid:
+            f_world = -f_world
+
+        mag = float(np.linalg.norm(f_world))
+        if mag < 1e-3:
+            continue
+
+        r = np.array(c.pos) - site_pos
+        F_w += f_world
+        M_w += np.cross(r, f_world)
+        contacts.append((np.array(c.pos), f_world, mag))
+
+    F_b = site_R.T @ F_w
+    M_b = site_R.T @ M_w
+    return np.concatenate([F_b, M_b]), contacts
 
 
-def probe_total_force(model, data):
-    return sum(f for _, _, f in get_all_contacts(model, data))
-
-
-def stem_tip_pos(model, data):
-    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "stem12")
+def stem_tip_pos(model, data, body_name):
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
     return data.xpos[bid].copy()
 
 
@@ -96,12 +113,13 @@ def draw_force_overlay(viewer, contacts, total_force):
     with viewer.lock():
         viewer.user_scn.ngeom = 0
 
-        for pos, normal, f_mag in contacts:
+        for pos, f_world, f_mag in contacts:
             arrow_len = min(f_mag * 0.005, 0.15)
             if arrow_len < 0.005:
                 continue
 
-            tip = pos + normal * arrow_len
+            direction = f_world / max(f_mag, 1e-9)
+            tip = pos + direction * arrow_len
 
             if viewer.user_scn.ngeom < viewer.user_scn.maxgeom:
                 g = viewer.user_scn.geoms[viewer.user_scn.ngeom]
@@ -141,11 +159,11 @@ def pygame_thread():
     font_b = pygame.font.SysFont("monospace", 14, bold=True)
     clock  = pygame.time.Clock()
 
-    PAD_L  = 72   # left padding for y-axis labels
+    PAD_L  = 72
     PAD_R  = 20
-    PAD_T  = 36   # top padding per panel (title)
-    PAD_B  = 30   # bottom padding for controls hint
-    GAP    = 26   # gap between the two panels
+    PAD_T  = 36
+    PAD_B  = 30
+    GAP    = 26
 
     panel_h = (H - PAD_T * 2 - PAD_B - GAP) // 2
 
@@ -158,7 +176,6 @@ def pygame_thread():
         pygame.draw.rect(screen, DGREY, rect)
         pygame.draw.rect(screen, GREY,  rect, 1)
 
-        # Title above the panel
         t_surf = font_b.render(title, True, WHITE)
         screen.blit(t_surf, (rect.left, rect.top - PAD_T + 4))
 
@@ -173,7 +190,6 @@ def pygame_thread():
         if hi - lo < 1e-9:
             hi = lo + max(abs(lo) * 0.1, 1e-3)
 
-        # Horizontal grid lines + y-axis tick labels
         for frac in [0.0, 0.25, 0.5, 0.75, 1.0]:
             gy = rect.bottom - int(frac * rect.height)
             pygame.draw.line(screen, GREY, (rect.left, gy), (rect.right, gy), 1)
@@ -181,12 +197,10 @@ def pygame_thread():
             lbl = font.render(f"{val:.4f}", True, GREY)
             screen.blit(lbl, (rect.left - 60, gy - 7))
 
-        # Vertical grid lines
         for frac in [0.25, 0.5, 0.75]:
             gx = rect.left + int(frac * rect.width)
             pygame.draw.line(screen, GREY, (gx, rect.top), (gx, rect.bottom), 1)
 
-        # Build point list
         n   = len(values)
         pts = []
         for i, v in enumerate(values):
@@ -194,7 +208,6 @@ def pygame_thread():
             y = rect.bottom - int((v - lo) / (hi - lo) * rect.height)
             pts.append((x, max(rect.top, min(rect.bottom, y))))
 
-        # Filled area under curve
         if len(pts) >= 2:
             fill = [pts[0]] + pts + [(pts[-1][0], rect.bottom), (pts[0][0], rect.bottom)]
             surf = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
@@ -203,21 +216,17 @@ def pygame_thread():
             screen.blit(surf, (rect.left, rect.top))
             pygame.draw.lines(screen, color, False, pts, 2)
 
-        # Current value dot
         if pts:
             pygame.draw.circle(screen, WHITE, pts[-1], 5)
             pygame.draw.circle(screen, color, pts[-1], 3)
 
-        # Live readout (inside top-right corner)
         readout = font_b.render(f"now: {values[-1]:.4f}", True, GOLD)
         screen.blit(readout, (rect.right - readout.get_width() - 6,
                                rect.top + 4))
 
-        # Y-axis label (rotated 90 deg)
         yl = pygame.transform.rotate(font.render(ylabel, True, GREY), 90)
         screen.blit(yl, (rect.left - 68, rect.centery - yl.get_height()//2))
 
-        # X-axis label only on the bottom panel
         if is_bottom:
             xl = font.render("← older samples                 newer →", True, GREY)
             screen.blit(xl, (rect.centerx - xl.get_width()//2, rect.bottom + 4))
@@ -238,7 +247,6 @@ def pygame_thread():
         draw_panel(disp_rect,  disp_vals,  BLUE,
                    "Stem Tip Displacement (m)", "Displ. (m)", is_bottom=True)
 
-        # Controls hint
         hint = font.render(
             "Arrows=move ball   [/]=up/dn   backslash=reset", True, GREY)
         screen.blit(hint, (PAD_L, H - 18))
@@ -250,30 +258,31 @@ def pygame_thread():
 
 
 def main():
-    print("Building plant ...")
+    print("Building strawberry plant ...")
     xml_mod  = XMLModifier()
-    system   = LSystemPlant(iterations=2, angle=np.pi / 7)
-    branches = system.generate_branches(max_branches=16,
-                                         n_stem_segments=12,
-                                         stem_height=0.38)
-    print(f"   {len(branches)} branches.")
-    for b in branches:
-        xml_mod.add_branch(
-            name=b["name"], parent=b["parent"],
-            pos=b["pos"],   direction=b["dir"],
-            length=b["length"], radius=b["radius"],
-            stiffness=b["stiffness"], damping=b["damping"],
-        )
+    system   = StrawberryLSystem(iterations=1, seed=42,
+                                 leaves_per_crown=4,
+                                 petiole_length=0.280,
+                                 petiole_segments=7,
+                                 leaf_scale=1.0)
+    elements = system.generate(root_parent="base")
+    print(f"   {len(elements)} plant elements "
+          f"({sum(1 for e in elements if e['type']=='crown')} crowns, "
+          f"{sum(1 for e in elements if e['type']=='petiole')} leaves)")
+    xml_mod.process_elements(elements)
     model_path = "deformable_plant.xml"
     xml_mod.save(model_path)
+    measurement_body = xml_mod.displacement_body
+    print(f"   displacement reference body: {measurement_body}")
 
     model = mujoco.MjModel.from_xml_path(model_path)
     data  = mujoco.MjData(model)
     qaddr, daddr = get_probe_indices(model)
 
-    START_POS = np.array([0.22, 0.0, 0.20])
+    START_POS = np.array([0.18, 0.0, 0.18])
     reset_probe(data, qaddr, daddr, START_POS)
 
+    # ramp gravity in slowly or the stiff joints explode
     print("Settling — ramping gravity to prevent explosion ...")
     model.opt.gravity[2] = 0.0
     for _ in range(int(0.3 / model.opt.timestep)):
@@ -289,8 +298,8 @@ def main():
         data.qvel[daddr:daddr+6] = 0.0
         mujoco.mj_step(model, data)
 
-    # rest position captured AFTER full gravity settling
-    rest = stem_tip_pos(model, data)
+    # capture rest AFTER settling, otherwise displacement is garbage
+    rest = stem_tip_pos(model, data, measurement_body)
     print(f"   Rest pos: {rest}")
 
     kb_active, kb = _start_keyboard()
@@ -337,13 +346,12 @@ def main():
 
             mujoco.mj_step(model, data)
 
-            contacts    = get_all_contacts(model, data)
-            total_force = sum(f for _, _, f in contacts)
+            wrench, contacts = read_probe_wrench(model, data)
+            total_force = float(np.linalg.norm(wrench[:3]))
 
             draw_force_overlay(viewer, contacts, total_force)
 
-            # displacement = Euclidean distance of stem12 from its rest position
-            tip  = stem_tip_pos(model, data)
+            tip  = stem_tip_pos(model, data, measurement_body)
             disp = float(np.linalg.norm(tip - rest))
 
             with shared["lock"]:
@@ -361,4 +369,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
